@@ -7,166 +7,151 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 import numpy as np
-import dbdicom as db
 import vreg
 import pydmr
 from miblab import pipe
 
-from cyst.utils import radiomics
-from cyst.utils.total_segmentator_class_maps import class_map
+import numpyradiomics
 
 PIPELINE = 'cyst'
+STUDY = {'BL': 'Baseline', 'FU': 'Followup'}
+UNITS = numpyradiomics.shape_units(3, 'mm')
 
-def run(build, logfile, organs=None):
-    maskpath = os.path.join(build, 'totseg', 'stage_1_segment')
-    measurepath = os.path.join(build, 'totseg', 'stage_3_measure', 'source_data')
+def _list_files(folder, recursive=False):
+    """Return (paths, names) for all files in a folder.
 
-    group = 'Controls'
-    sitemaskpath = os.path.join(maskpath, group)
-    sitemeasurepath = os.path.join(measurepath, group) 
-    measure_task(sitemaskpath, sitemeasurepath, task='total_mr', organs=organs)
-    measure_task(sitemaskpath, sitemeasurepath, task='tissue_types_mr', organs=organs)
+    paths : list of full file paths (pathlib.Path), sorted
+    names : list of file names (str), in the same order
+    """
+    folder = Path(folder)
+    pattern = "**/*" if recursive else "*"
+    paths = sorted(p for p in folder.glob(pattern) if p.is_file())
+    names = [p.name for p in paths]
+    return paths, names
 
-    group = 'Patients'   
-    for site in ['Bari', 'Bordeaux', 'Exeter', 'Leeds', 'Sheffield', 'Turku']:
-        sitemaskpath = os.path.join(maskpath, group, site)
-        sitemeasurepath = os.path.join(measurepath, group, site)
-        measure_task(sitemaskpath, sitemeasurepath, task='total_mr', organs=organs)
-        measure_task(sitemaskpath, sitemeasurepath, task='tissue_types_mr', organs=organs)
+def laterality(mask):
+    """Return 'L' or 'R' depending on which side of x=0 the mask's center of
+    mass lies, in world (RAS+) coordinates: negative x is left, positive x is right.
+
+    mask : nibabel image (e.g. Nifti1Image) holding a 3D mask; any nonzero
+           voxel counts as part of the mask.
+    """
+    voxels = np.argwhere(np.asanyarray(mask) != 0)
+    if len(voxels) == 0:
+        raise ValueError("mask is empty")
+
+    com = voxels.mean(axis=0)                   # centre of mass in voxel indices
+    x = com[0]
+    return 'R' if x > 0 else 'L'
+
+
+def param(p, idx, side): 
+    return f"{side}K-C{str(idx).zfill(3)}-{p}"
+
+def run(build, logfile):
+
+    dir_output = pipe.stage_output_dir(build, PIPELINE, __file__)
+    dir_cysts = os.path.join(build, 'cyst', 'stage_2_segmentations')
     
-    concatenate(measurepath)   
+    # for database in ['Controls', 'Patients']:
+    for database in ['Patients']:
+
+        logging.info(f"--- Running {database} ---")
+        db_cysts = os.path.join(dir_cysts, database) 
+        db_output = os.path.join(dir_output, database)
+        run_db(db_cysts, db_output)
+
+    logging.info(f"--- Combining results ---")
+    concatenate(dir_output)   
 
 
-def measure_task(sitemaskpath, sitemeasurepath, task='total_mr', organs=None):
-    os.makedirs(sitemeasurepath, exist_ok=True)
-    masks = db.series(sitemaskpath)
+def run_db(db_cysts, dir_output):
 
-    if not organs:
-        #tasks = [measure_image(mask, sitemeasurepath, task) for mask in masks]
-        tasks = [delayed(measure_image)(mask, sitemeasurepath, task) for mask in masks]
-    else:
-        tasks = []
-        for mask in masks:
-            for organ in organs:
-                #measure_image(mask, sitemeasurepath, task, organ)
-                tasks.append(delayed(measure_image)(mask, sitemeasurepath, task, organ))
+    os.makedirs(dir_output, exist_ok=True)
+    files, names = _list_files(db_cysts)
 
-    Parallel(n_jobs=-1)(tasks)
+    # [run_study(dir_output, names[i], cyst_file) for i, cyst_file in enumerate(files)]
+
+    Parallel(n_jobs=-1)([delayed(run_study)(dir_output, names[i], cyst_file) for i, cyst_file in enumerate(files)])
 
 
-def measure_image(automask, sitemeasurepath, task, organ=None):
+def run_study(dir_output, name, cyst_file):
 
-    patient, study, series = automask[1], automask[2][0], automask[3][0]
+    patient_id, study = name[:8], STUDY[name[9:11]]
 
-    # Skip if not the requested task
-    if task != series:
-        return
-
-    # If the results already exist, skip
-    if organ:
-        dmr_file = os.path.join(sitemeasurepath, f'{patient}_{study}_{series}_{organ}')
-    else:
-        dmr_file = os.path.join(sitemeasurepath, f'{patient}_{study}_{series}')
+    dmr_file = os.path.join(dir_output, f'{patient_id}_{study}')
     if os.path.exists(f'{dmr_file}.dmr.zip'):
         return
     
-    print(f"Computing {dmr_file}")
+    logging.info(f"--- Running patient {patient_id}, study {study} ---")
 
     # Get mask volume 
-    vol = db.volume(automask, verbose=0)
+    cyst_vol = vreg.read_nifti(cyst_file).to_right_handed()
+    cyst_labels = [int(l) for l in np.unique(cyst_vol.values) if l != 0]
 
     # Init results
     dmr = {'data':{}, 'pars':{}}
+    all_study_results = {}
     
-    # Loop over the classes
-    for idx, roi in tqdm(class_map[task].items()):
+    # Loop over the cysts
+    for idx in cyst_labels:
 
-        # Skip if not the requested organ
-        if organ is not None:
-            if organ != roi:
-                continue
+        logging.info(f"--- Running patient {patient_id}, study {study}, cyst {idx} ---")
 
         # Binary mask
-        mask = (vol.values==idx).astype(np.float32)
+        mask = (cyst_vol.values==idx).astype(np.float32)
         if np.sum(mask) == 0:
             continue
 
-        roi_vol = vreg.volume(mask, vol.affine)
+        side = laterality(mask)
+        vol = vreg.volume(mask, cyst_vol.affine)
         
         # Get skimage features
         try:
-            results = radiomics.volume_features(roi_vol, roi)
+            results = numpyradiomics.shape(vol.values.T, vol.spacing[::-1])
         except Exception as e:
-            logging.error(f"Patient {patient} {roi} - error computing ski-shapes: {e}")
-        else:
-            dmr['data'] = dmr['data'] | {p: v[1:] for p, v in results.items()}
-            dmr['pars'] = dmr['pars'] | {(patient, study, p): v[0] for p, v in results.items()}
+            logging.error(f"Patient {patient_id} - cyst K_{idx} - error computing shapes: {e}")
+            continue
 
-        # # Get radiomics shape features
-        # # Take out for now because of installation issues
-        # try:
-        #     t = time.time()
-        #     results = radiomics.shape_features(roi_vol, roi)
-        #     print('pyrad time', time.time() - t)
-        # except Exception as e:
-        #     logging.error(f"Patient {patient} {roi} - error computing radiomics-shapes: {e}")
-        # else:
-        #     dmr['data'] = dmr['data'] | {p:v[1:] for p, v in results.items()}
-        #     dmr['pars'] = dmr['pars'] | {(patient, study, p): v[0] for p, v in results.items()}
+        dmr['data'] = dmr['data'] | {param(p, idx, side): [param(p, idx, side), UNITS[p], 'float'] for p in results.keys()}
+        dmr['pars'] = dmr['pars'] | {(patient_id, study, param(p, idx, side)): v for p, v in results.items()}
 
-        # Get numpyradiomics shape features
-        try:
-            results = radiomics.shape_features_nprad(roi_vol, roi)
-        except Exception as e:
-            logging.error(f"Patient {patient} {roi} - error computing radiomics-shapes: {e}")
-        else:
-            dmr['data'] = dmr['data'] | {p:v[1:] for p, v in results.items()}
-            dmr['pars'] = dmr['pars'] | {(patient, study, p): v[0] for p, v in results.items()}
+        all_study_results |= {(p, idx, side): v for p, v in results.items()}
 
     # Append parsed biomarkers in the dictionary for convenience
-    dmr['columns'] = ['body_part', 'biomarker_category', 'biomarker']
+    dmr['columns'] = ['kidney', 'cyst', 'biomarker']
     for p in dmr['data']:
         dmr['data'][p] += p.split('-')
 
-    # Write results to file
+    logging.info(f"--- Saving results for patient {patient_id}, study {study} ---")
     pydmr.write(dmr_file, dmr)
 
 
-def concatenate(measurepath):
+def concatenate(dir_output):
 
     for group in ['Controls', 'Patients']:
-        folder = os.path.join(measurepath, group) 
+        folder = os.path.join(dir_output, group) 
         folder = Path(folder)
         dmr_files = list(folder.rglob("*.dmr.zip"))
         if dmr_files == []:
             continue
         dmr_files = [str(f) for f in dmr_files]
-        dmr_file = os.path.join(Path(measurepath).parent, f'{group}_all_results.dmr.zip')
+        dmr_file = os.path.join(Path(dir_output), f'{group}_results.dmr.zip')
         pydmr.concat(dmr_files, dmr_file)
 
         # Create some derived formats for convenience
 
         # 1. Long format with additional columns (units, type, description)
-        long_format_file = os.path.join(Path(measurepath).parent, f'{group}_all_results_long.csv')
+        long_format_file = os.path.join(Path(dir_output), f'{group}_results_long.csv')
         pydmr.pars_to_long(dmr_file, long_format_file)
 
         # 2. Wide format
-        wide_format_file = os.path.join(Path(measurepath).parent, f'{group}_all_results_wide.csv')
+        wide_format_file = os.path.join(Path(dir_output), f'{group}_results_wide.csv')
         pydmr.pars_to_wide(dmr_file, wide_format_file)
 
 
 
 if __name__=='__main__':
-
-    # python src/ibeat_totseg/stage_3_measure.py --build=C:\Users\md1spsx\Documents\Data\iBEAt_Build --organs aorta
-
+    
     BUILD = r"C:\Users\md1spsx\Documents\Data\iBEAt_Build"
-    kwargs = {
-        "organs": {
-            'type': str, 
-            'default': None, 
-            'nargs': '+',  # multiple arguments allowed separated by space
-            'help': 'Organs',
-        }
-    }
-    pipe.run_stage(run, BUILD, PIPELINE, __file__, **kwargs)
+    pipe.run_stage(run, BUILD, PIPELINE, __file__)

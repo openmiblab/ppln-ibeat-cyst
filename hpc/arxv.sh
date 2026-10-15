@@ -24,10 +24,8 @@ module load Anaconda3/2024.02-1
 module load Python/3.10.8-GCCcore-12.2.0 # essential to load latest GCC
 
 # Define path variables here
-ENV="/mnt/parscratch/users/$(whoami)/envs/template"
-CODE="/mnt/parscratch/users/$(whoami)/scripts/ppln-template/src/template"
-BUILD="/mnt/parscratch/users/$(whoami)/data/demo"
-ARCHIVE="login1:/shared/abdominal_imaging/Archive/demo"
+LOCAL="/mnt/parscratch/users/$(whoami)/data/iBEAt_Build"
+ARCHIVE="loginb:/shared/abdominal_imaging/Archive/iBEAt_Build"
 
 # srun runs your program on the allocated compute resources managed by Slurm
-rsync -av --no-group --no-perms "$BUILD/template" "$ARCHIVE"
+rsync -av --no-group --no-perms "$ARCHIVE/kidneyvol/stage_3_edit" "$LOCAL/kidneyvol" 
