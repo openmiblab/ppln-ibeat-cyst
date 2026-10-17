@@ -74,7 +74,7 @@ def run(build, logfile):
                     in_arr = db.volume(series_in, verbose=0).to_right_handed().values
                 except:
                     logging.exception(f"Error reading in-phase images for {patient_id}, {study}, {sequence}.")
-                    return
+                    continue
 
                 logging.info(f"Reading masks")
                 mask_arr = db.volume(series_masks, verbose=0).to_right_handed().values
